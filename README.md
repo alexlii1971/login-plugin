@@ -805,3 +805,221 @@ add_action('wp_login', function($user_login, $user) {
 }, 10, 2);
 ```
  
+### **关键功能代码原型 - Part 4/4**
+
+---
+
+#### **10. 安全增强实现**
+```php
+// File: includes/security/class-data-encryption.php
+
+class WC_Data_Encryptor {
+    const METHOD = 'aes-256-cbc';
+    
+    public static function encrypt($data) {
+        $key = defined('AUTH_SALT') ? AUTH_SALT : '';
+        $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length(self::METHOD));
+        
+        return base64_encode($iv . openssl_encrypt(
+            $data, 
+            self::METHOD, 
+            $key, 
+            0, 
+            $iv
+        ));
+    }
+
+    public static function decrypt($encrypted) {
+        $key = defined('AUTH_SALT') ? AUTH_SALT : '';
+        $data = base64_decode($encrypted);
+        $iv = substr($data, 0, openssl_cipher_iv_length(self::METHOD));
+        
+        return openssl_decrypt(
+            substr($data, openssl_cipher_iv_length(self::METHOD)), 
+            self::METHOD, 
+            $key, 
+            0, 
+            $iv
+        );
+    }
+}
+
+// 微信OpenID加密存储示例
+add_action('wp_insert_user', function($user_id) {
+    if (!empty($_POST['wechat_unionid'])) {
+        $encrypted = WC_Data_Encryptor::encrypt($_POST['wechat_unionid']);
+        update_user_meta($user_id, 'wechat_unionid_encrypted', $encrypted);
+    }
+});
+```
+
+---
+
+#### **11. 后台管理系统实现**
+```php
+// File: admin/class-admin-settings.php
+
+class WC_MultiLogin_Admin {
+    public function __construct() {
+        add_action('admin_init', [$this, 'register_settings']);
+        add_action('admin_menu', [$this, 'add_admin_menu']);
+    }
+
+    public function register_settings() {
+        register_setting('multi_login_settings', 'wc_sms_enabled');
+        register_setting('multi_login_settings', 'wc_wechat_appid');
+        
+        // 短信设置模块
+        add_settings_section(
+            'sms_settings',
+            '短信配置',
+            function() { echo '<p>短信服务商参数设置</p>'; },
+            'multi_login_settings'
+        );
+
+        add_settings_field(
+            'wc_sms_enabled',
+            '启用短信验证',
+            [$this, 'render_checkbox'],
+            'multi_login_settings',
+            'sms_settings',
+            ['name' => 'wc_sms_enabled']
+        );
+    }
+
+    public function render_checkbox($args) {
+        $value = get_option($args['name']);
+        echo "<input type='checkbox' name='{$args['name']}' value='1' " 
+           . checked(1, $value, false) . ">";
+    }
+
+    public function add_admin_menu() {
+        add_submenu_page(
+            'woocommerce',
+            '多方式登录设置',
+            '登录管理',
+            'manage_options',
+            'multi-login-settings',
+            [$this, 'render_settings_page']
+        );
+    }
+
+    public function render_settings_page() {
+        include plugin_dir_path(__FILE__) . 'views/admin-settings.php';
+    }
+}
+```
+
+---
+
+#### **12. 调试日志集成**
+```php
+// File: includes/class-debug-logger.php
+
+class WC_MultiLogin_Logger {
+    public static function log($message, $level = 'info') {
+        $logger = wc_get_logger();
+        $context = ['source' => 'multi-login'];
+        
+        switch ($level) {
+            case 'error':
+                $logger->error($message, $context);
+                break;
+            case 'warning':
+                $logger->warning($message, $context);
+                break;
+            default:
+                $logger->info($message, $context);
+        }
+    }
+
+    public static function debug_mode_check() {
+        if (get_option('wc_enable_debug_log')) {
+            add_filter('woocommerce_logging_enabled', '__return_true');
+        }
+    }
+}
+
+// 调试模式初始化
+add_action('init', [WC_MultiLogin_Logger::class, 'debug_mode_check']);
+```
+
+---
+
+#### **13. GDPR合规实现**
+```php
+// File: includes/compliance/class-gdpr.php
+
+class WC_GDPR_Compliance {
+    public function __construct() {
+        add_filter('wp_privacy_personal_data_exporters', [$this, 'register_exporter']);
+        add_filter('wp_privacy_personal_data_erasers', [$this, 'register_eraser']);
+    }
+
+    public function register_exporter($exporters) {
+        $exporters['multi-login'] = [
+            'exporter_friendly_name' => '多方式登录数据',
+            'callback' => [$this, 'export_user_data']
+        ];
+        return $exporters;
+    }
+
+    public function export_user_data($email) {
+        $user = get_user_by('email', $email);
+        return [
+            'data' => [
+                [
+                    'group_id' => 'multi_login',
+                    'group_label' => '登录数据',
+                    'item_id' => 'user_' . $user->ID,
+                    'data' => [
+                        '手机号' => get_user_meta($user->ID, 'billing_phone', true),
+                        '微信绑定时间' => get_user_meta($user->ID, 'wechat_bind_date', true)
+                    ]
+                ]
+            ]
+        ];
+    }
+
+    public function register_eraser($erasers) {
+        $erasers['multi-login'] = [
+            'eraser_friendly_name' => '清除登录数据',
+            'callback' => [$this, 'erase_user_data']
+        ];
+        return $erasers;
+    }
+
+    public function erase_user_data($email) {
+        $user = get_user_by('email', $email);
+        delete_user_meta($user->ID, 'wechat_unionid_encrypted');
+        return ['items_removed' => true];
+    }
+}
+```
+
+---
+
+### **部署与测试指南**
+1. **数据库初始化**：
+   ```sql
+   CREATE TABLE IF NOT EXISTS {$wpdb->prefix}multilogin_logs (
+     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     user_id BIGINT UNSIGNED,
+     action VARCHAR(50) NOT NULL,
+     details TEXT,
+     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+   ```
+
+2. **测试命令示例**：
+   ```bash
+   # 触发短信发送测试
+   wp eval "WC_SMS_Verification::send_test('13800138000')"
+   
+   # 查看调试日志
+   wp wc log list --source=multi-login
+   ```
+
+---
+ 
