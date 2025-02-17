@@ -532,3 +532,141 @@ function get_user_site_by_phone($phone) {
     return get_site(get_user_main_site($user_id));
 }
 ```
+
+
+--------------------
+
+### **关键功能代码原型 - Part 2/4**
+
+---
+
+#### **4. 短信验证核心模块**
+```php
+// File: includes/sms/class-sms-core.php
+
+class WC_SMS_Verification {
+    const PREFIX = 'wc_sms_';
+
+    /**
+     * 发送验证码主逻辑
+     */
+    public function send_code($phone) {
+        // 频率控制检查
+        if ($this->is_flooding($phone)) {
+            throw new Exception('请求过于频繁，请稍后重试');
+        }
+
+        // 生成6位数字验证码
+        $code = wp_rand(100000, 999999);
+        
+        // 存储验证码（加密存储）
+        set_transient(
+            self::PREFIX . md5($phone),
+            wp_hash_password($code),
+            $this->get_code_expiry()
+        );
+
+        // 调用网关发送
+        $gateway = $this->get_active_gateway();
+        return $gateway->send(
+            $phone,
+            get_option('wc_sms_template_reg'),
+            ['code' => $code]
+        );
+    }
+
+    /**
+     * 验证码校验
+     */
+    public function verify_code($phone, $input_code) {
+        $hashed_code = get_transient(self::PREFIX . md5($phone));
+        
+        // 验证有效性
+        return $hashed_code && 
+               wp_check_password($input_code, $hashed_code);
+    }
+
+    /**
+     * 获取当前启用的网关
+     */
+    private function get_active_gateway() {
+        $gateways = [
+            'aliyun' => 'WC_Aliyun_SMS',
+            'tencent' => 'WC_Tencent_SMS'
+        ];
+        
+        $active = get_option('wc_sms_active_gateway');
+        return new $gateways[$active]();
+    }
+}
+```
+
+#### **5. 阿里云短信网关实现**
+```php
+// File: includes/sms/gateways/class-aliyun-sms.php
+
+class WC_Aliyun_SMS {
+    public function send($phone, $template_id, $params) {
+        $config = [
+            'access_key' => get_option('wc_sms_aliyun_key'),
+            'secret' => get_option('wc_sms_aliyun_secret'),
+            'sign_name' => get_option('wc_sms_aliyun_sign')
+        ];
+
+        $client = new Aliyun\Core\DefaultAcsClient(
+            new Aliyun\Core\Profile\DefaultProfile(
+                $config['access_key'],
+                $config['secret']
+            )
+        );
+
+        $request = new Aliyun\Api\Sms\Request\V20170525\SendSmsRequest();
+        $request->setPhoneNumbers($phone);
+        $request->setTemplateCode($template_id);
+        $request->setTemplateParam(json_encode($params));
+        $request->setSignName($config['sign_name']);
+
+        try {
+            $response = $client->getAcsResponse($request);
+            return $response->Code === 'OK';
+        } catch (Exception $e) {
+            wc_get_logger()->error('阿里云短信异常: ' . $e->getMessage());
+            return false;
+        }
+    }
+}
+```
+
+#### **6. 频率控制实现**
+```php
+// File: includes/sms/class-sms-anti-flood.php
+
+class WC_SMS_Flood_Control {
+    public function is_flooding($phone) {
+        $last_sent = get_transient('wc_sms_last_sent_' . $phone);
+        $retry_window = get_option('wc_sms_retry_interval', 60);
+
+        // 60秒内不允许重复发送
+        if ($last_sent && (time() - $last_sent) < $retry_window) {
+            return true;
+        }
+
+        // 记录本次发送时间
+        set_transient('wc_sms_last_sent_' . $phone, time(), $retry_window);
+        return false;
+    }
+
+    public function daily_limit_check($phone) {
+        $count_key = 'wc_sms_daily_' . date('Ymd') . '_' . $phone;
+        $count = get_transient($count_key) ?: 0;
+        
+        $max_daily = get_option('wc_sms_max_daily', 10);
+        if ($count >= $max_daily) {
+            throw new Exception('今日验证码发送已达上限');
+        }
+
+        set_transient($count_key, $count + 1, DAY_IN_SECONDS);
+    }
+}
+```
+ 
