@@ -421,4 +421,114 @@ function get_sms_gateway() {
    - 数据库存储标准化E.164格式
 
 --- 
- 
+
+ **第一部分：跨站点用户同步实现**：
+
+---
+
+### **关键功能代码原型 - Part 1/4**
+
+#### **1. 多站点用户同步核心逻辑**
+```php
+// File: includes/class-multisite-sync.php
+
+class Multisite_User_Sync {
+    
+    /**
+     * 在主站创建用户后同步到其他站点
+     * @hook wpmu_activate_user
+     */
+    public function sync_new_user($user_id, $password, $meta) {
+        if (!is_multisite()) return;
+        
+        $primary_blog_id = get_current_blog_id();
+        
+        // 获取所有子站点
+        $sites = get_sites(['exclude' => $primary_blog_id]);
+        
+        foreach ($sites as $site) {
+            switch_to_blog($site->blog_id);
+            
+            // 检查用户是否已存在
+            if (!get_user_by('id', $user_id)) {
+                // 添加用户到子站点
+                add_existing_user_to_blog([
+                    'user_id' => $user_id,
+                    'role'    => get_option('default_role')
+                ]);
+                
+                // 同步元数据
+                $this->sync_user_meta($user_id, $meta);
+            }
+            
+            restore_current_blog();
+        }
+    }
+    
+    /**
+     * 同步用户元数据规则
+     */
+    private function sync_user_meta($user_id, $meta) {
+        $sync_keys = apply_filters('multisite_sync_meta_keys', [
+            'billing_phone',
+            'phone_verified',
+            'wechat_unionid'
+        ]);
+        
+        foreach ($sync_keys as $key) {
+            if (isset($meta[$key])) {
+                update_user_meta($user_id, $key, $meta[$key]);
+            }
+        }
+    }
+}
+
+// 初始化
+add_action('plugins_loaded', function() {
+    $sync = new Multisite_User_Sync();
+    add_action('wpmu_activate_user', [$sync, 'sync_new_user'], 10, 3);
+});
+```
+
+#### **2. 站点切换登录状态保持**
+```php
+// File: includes/class-cross-site-login.php
+
+add_action('set_logged_in_cookie', function($logged_in_cookie) {
+    // 统一主站与子站cookie设置
+    $_COOKIE[LOGGED_IN_COOKIE] = $logged_in_cookie;
+});
+
+add_filter('auth_cookie', function($cookie, $user_id, $expiration) {
+    // 跨站点共享认证cookie
+    $cookie['path'] = '/';
+    $cookie['domain'] = COOKIE_DOMAIN;
+    return $cookie;
+}, 10, 3);
+```
+
+#### **3. 用户查询增强**
+```php
+// File: includes/class-user-query.php
+
+add_filter('pre_get_site_by_path', function($site, $domain, $path, $segments) {
+    // 允许通过手机号查询用户
+    if (is_phone_number($domain)) {
+        return get_user_site_by_phone($domain);
+    }
+    return $site;
+}, 10, 4);
+
+function get_user_site_by_phone($phone) {
+    global $wpdb;
+    
+    $user_id = $wpdb->get_var($wpdb->prepare(
+        "SELECT user_id FROM {$wpdb->usermeta} 
+        WHERE meta_key = 'billing_phone' 
+        AND meta_value = %s", 
+        $phone
+    ));
+    
+    return get_site(get_user_main_site($user_id));
+}
+```
