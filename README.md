@@ -672,3 +672,136 @@ class WC_SMS_Flood_Control {
 }
 ```
  
+### **关键功能代码原型 - Part 3/4**
+
+---
+
+#### **7. 微信登录核心集成**
+```php
+// File: includes/wechat/class-wechat-oauth.php
+
+class WC_WeChat_OAuth {
+    const API_URL = 'https://api.weixin.qq.com/sns/oauth2/access_token';
+
+    public function get_auth_url($scope = 'snsapi_base') {
+        $callback = urlencode($this->get_callback_url());
+        $appid = get_option('wc_wechat_appid');
+        
+        return "https://open.weixin.qq.com/connect/oauth2/authorize?" . http_build_query([
+            'appid' => $appid,
+            'redirect_uri' => $callback,
+            'response_type' => 'code',
+            'scope' => $scope,
+            'state' => wp_create_nonce('wechat_auth')
+        ]) . "#wechat_redirect";
+    }
+
+    public function handle_callback() {
+        // 验证state参数
+        if (!wp_verify_nonce($_GET['state'], 'wechat_auth')) {
+            throw new Exception('非法请求来源');
+        }
+
+        // 获取access_token
+        $response = wp_remote_get(self::API_URL . '?' . http_build_query([
+            'appid' => get_option('wc_wechat_appid'),
+            'secret' => get_option('wc_wechat_secret'),
+            'code' => $_GET['code'],
+            'grant_type' => 'authorization_code'
+        ]);
+
+        $data = json_decode($response['body'], true);
+        
+        // 获取用户唯一标识
+        return $this->process_user($data['unionid'] ?? $data['openid']);
+    }
+
+    private function process_user($wechat_id) {
+        // 查找已绑定用户
+        $users = get_users([
+            'meta_key' => 'wechat_unionid',
+            'meta_value' => $wechat_id,
+            'number' => 1
+        ]);
+
+        if (!empty($users)) {
+            return $users[0];
+        }
+
+        // 新用户处理
+        return $this->create_wechat_user($wechat_id);
+    }
+}
+```
+
+#### **8. 前端登录表单增强**
+```php
+// File: templates/wechat-login-form.php
+
+add_action('woocommerce_login_form', 'add_wechat_login_button');
+add_action('woocommerce_register_form', 'add_wechat_login_button');
+
+function add_wechat_login_button() {
+    if (get_option('wc_wechat_enabled')): ?>
+        <div class="wechat-login-wrapper">
+            <button type="button" 
+                    class="button wechat-login-btn"
+                    onclick="initWechatAuth()">
+                <img src="<?= plugins_url('assets/wechat-icon.png', __FILE__) ?>">
+                微信登录
+            </button>
+        </div>
+        
+        <script>
+        function initWechatAuth() {
+            // 微信环境检测
+            <?php if(wp_is_mobile()): ?>
+                window.location.href = '<?= WC_WeChat_OAuth::get_auth_url() ?>';
+            <?php else: ?>
+                new QRCode(document.getElementById('qrcode'), {
+                    text: '<?= WC_WeChat_OAuth::get_auth_url('snsapi_login') ?>'
+                });
+            <?php endif; ?>
+        }
+        </script>
+    <?php endif;
+}
+```
+
+---
+
+#### **9. 用户绑定流程处理**
+```php
+// File: includes/class-user-binding.php
+
+class WC_User_Binding {
+    public function enforce_binding($user_id) {
+        if (!$this->is_profile_complete($user_id)) {
+            // 存储当前状态到会话
+            WC()->session->set('pending_user', $user_id);
+            wp_redirect(wc_get_account_endpoint_url('bind-profile'));
+            exit;
+        }
+    }
+
+    private function is_profile_complete($user_id) {
+        return get_user_meta($user_id, 'billing_phone', true) 
+            && get_user_meta($user_id, 'phone_verified', true);
+    }
+
+    public function handle_binding_form() {
+        // 短代码处理
+        add_shortcode('wechat_bind_form', function() {
+            ob_start();
+            wc_get_template('myaccount/bind-form.php');
+            return ob_get_clean();
+        });
+    }
+}
+
+// 初始化绑定检查
+add_action('wp_login', function($user_login, $user) {
+    (new WC_User_Binding())->enforce_binding($user->ID);
+}, 10, 2);
+```
+ 
